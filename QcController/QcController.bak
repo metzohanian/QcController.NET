@@ -1,0 +1,577 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.IO.Ports;
+
+namespace SurfaceMachineSystems.QcController
+{
+    public delegate void DiagnosticOutputHandler(string DiagnosticLine);
+
+    public class QcController
+    {
+        public event DiagnosticOutputHandler DiagnosticOutput = delegate { };
+
+        private SerialPort Port;
+        public string Buffer;
+
+        private List<QcCommand> commands;
+
+        private List<string> Responses;
+        private int LastUnprocessedResponse = 0;
+
+        Dictionary<int, List<CommandStructure>> motorCommands; // motor id: commands
+        Dictionary<int, QcMessage> lastMessages;
+        Dictionary<int, int> currentCommands;
+
+        private System.Timers.Timer CommunicationTimer;
+
+        int messages = 2000;
+
+        public QcController()
+        {
+            Port = new SerialPort();
+            Port.BaudRate = 57600;
+            Port.StopBits = StopBits.Two;
+            Port.DataBits = 8;
+            Port.NewLine = "\r";
+
+            Port.DataReceived += new SerialDataReceivedEventHandler(Port_DataReceived);
+
+            commands = new List<QcCommand>();
+            commands.Add(QcCommand.CIS);
+            commands.Add(QcCommand.CPL);
+            commands.Add(QcCommand.HLT);
+            commands.Add(QcCommand.POL);
+            commands.Add(QcCommand.POR);
+            commands.Add(QcCommand.RIS);
+            commands.Add(QcCommand.RRG);
+            commands.Add(QcCommand.RSP);
+            commands.Add(QcCommand.RST);
+            commands.Add(QcCommand.MRT);
+            commands.Add(QcCommand.MRV);
+            commands.Add(QcCommand.ZTP);
+            commands.Add(QcCommand.MAV);
+
+            Responses = new List<string>();
+
+            Buffer = "";
+
+            motorCommands = new Dictionary<int, List<CommandStructure>>();
+            lastMessages = new Dictionary<int, QcMessage>();
+            currentCommands = new Dictionary<int, int>();
+
+            CommunicationTimer = new System.Timers.Timer();
+            CommunicationTimer.Enabled = false;
+            CommunicationTimer.Interval = 5;
+            CommunicationTimer.Elapsed += new System.Timers.ElapsedEventHandler(CommunicationTimer_Elapsed);
+        }
+
+        void CommunicationTimer_Elapsed(object sender, System.Timers.ElapsedEventArgs e)
+        {
+            RunCommands(null);
+        }
+
+        private string ProcessMotionState(int MotorAddress, int command_index, CommandStructure command, QcMessage message, bool MessagePrompt)
+        {
+            string msg = "";
+            Console.WriteLine("Motion State: [" + MotorAddress + "]: " + command.MotionPollingState.ToString());
+            switch (command.MotionPollingState)
+            {
+                case QcMotionPollingState.Start:
+                    command.MotionPollingState = QcMotionPollingState.POL_Start;
+                    msg = QcDatagram.TranslateCommand(MotorAddress, QcCommand.POL);
+                    command.History.Add(new CommandState()
+                    {
+                        RetransmitState = command.RetransmitState,
+                        RunModeState = command.RunModeState,
+                        MotionPollingState = command.MotionPollingState,
+                        TxString = msg,
+                        Command = QcCommand.POL
+                    });
+                    command.DelayUntil = DateTime.Now;
+                    break;
+                case QcMotionPollingState.POL_Start:
+                    if (MessagePrompt)
+                    {
+                        command.MotionPollingState = QcMotionPollingState.CPL_Start;
+                        msg = QcDatagram.TranslateCommand(MotorAddress, QcCommand.CPL, new List<string>(new string[] { "65535" }));
+                        command.History.Add(new CommandState()
+                        {
+                            RetransmitState = command.RetransmitState,
+                            RunModeState = command.RunModeState,
+                            MotionPollingState = command.MotionPollingState,
+                            TxString = msg,
+                            Command = QcCommand.CPL
+                        });
+                        command.DelayUntil = DateTime.Now;
+                    }
+                    break;
+                case QcMotionPollingState.CPL_Start:
+                    if (MessagePrompt)
+                    {
+                        command.MotionPollingState = QcMotionPollingState.Motion;
+                        msg = command.TxCommand;
+                        command.History.Add(new CommandState()
+                        {
+                            RetransmitState = command.RetransmitState,
+                            RunModeState = command.RunModeState,
+                            MotionPollingState = command.MotionPollingState,
+                            TxString = msg,
+                            Command = command.Command,
+                            Parameters = command.Parameters
+                        });
+                        command.DelayUntil = DateTime.Now;
+                    }
+                    break;
+                case QcMotionPollingState.Motion:
+                    if (MessagePrompt)
+                    {
+                        command.MotionPollingState = QcMotionPollingState.POL_Delay;
+                        msg = QcDatagram.TranslateCommand(MotorAddress, QcCommand.POL);
+                        command.History.Add(new CommandState()
+                        {
+                            RetransmitState = command.RetransmitState,
+                            RunModeState = command.RunModeState,
+                            MotionPollingState = command.MotionPollingState,
+                            TxString = msg,
+                            Command = QcCommand.POL
+                        });
+                        command.DelayUntil = DateTime.Now;
+                    }
+                    break;
+                case QcMotionPollingState.POL_Delay:
+                    if (message.Psw.Count > 0)
+                    {
+                        if (message.Psw.Contains(QcPsw.PCmdDone))
+                        {
+                            command.MotionPollingState = QcMotionPollingState.Complete_CPL_Clear;
+                            msg = QcDatagram.TranslateCommand(MotorAddress, QcCommand.CPL, new List<string>(new string[] { "8192" }));
+                            command.History.Add(new CommandState()
+                            {
+                                RetransmitState = command.RetransmitState,
+                                RunModeState = command.RunModeState,
+                                MotionPollingState = command.MotionPollingState,
+                                TxString = msg,
+                                Command = QcCommand.CPL,
+                                Parameters = new List<string>(new string[] { "8192" })
+                            });
+                            command.DelayUntil = DateTime.Now;
+                        }
+                    }
+                    else if (motorCommands[MotorAddress][command_index].DelayUntil <= DateTime.Now)
+                    {
+                        msg = QcDatagram.TranslateCommand(MotorAddress, QcCommand.POL);
+                        command.DelayUntil = DateTime.Now.AddMilliseconds(100.0);
+                    }
+                    break;
+                case QcMotionPollingState.Complete_CPL_Clear:
+                    if (MessagePrompt)
+                    {
+                        command.MotionPollingState = QcMotionPollingState.Complete;
+                        command.RunModeState = RunMode.Complete;
+                    }
+                    break;
+                case QcMotionPollingState.Complete:
+                    command.RunModeState = RunMode.Complete;
+                    break;
+            }
+            motorCommands[MotorAddress][command_index] = command;
+
+            return msg;
+        }
+
+        private void RunCommands(int? ResponseIndex)
+        {
+            lock (CommunicationTimer)
+            {
+                messages--;
+                if (messages <= 0)
+                    Console.ReadKey();
+                string Response = null;
+                DateTime CurrentTime = DateTime.Now;
+                QcMessage message = new QcMessage()
+                {
+                    Type = PacketType.NoMessage,
+                    Psw = new List<QcPsw>()
+                };
+                if (ResponseIndex != null)
+                {
+                    Response = Responses[(int)ResponseIndex];
+                    message = QcDatagram.ParseResponse(Response);
+                    lastMessages[message.MotorAddress] = message;
+                    Console.WriteLine("\t" + Response);
+                    if (QcDatagram.PswError(message.Psw) && motorCommands[message.MotorAddress][currentCommands[message.MotorAddress]].History.Last().Command != QcCommand.POL)
+                    {
+                        if (!QcDatagram.CommandComplete(message.Psw) && !QcDatagram.PswError(message.Psw, true))
+                        {
+                            /*****************************************************
+                             * 
+                             * This ignores Framing Errors.
+                             * This should do something clever with retransmission on 
+                             *  framing errors, instead.
+                             * 
+                             ****************************************************/
+                        }
+                        else
+                        {
+                            Console.ForegroundColor = ConsoleColor.Red;
+                            Console.BackgroundColor = ConsoleColor.DarkRed;
+                            Console.Write("Motor Error: " + message.MotorAddress.ToString());
+                            Console.ResetColor();
+                            Console.WriteLine();
+                            if (QcDatagram.PswError(message.Psw, true))
+                            {
+                                HaltCurrentCommand(message.MotorAddress);
+                            }
+                            else
+                            {
+                                CommandStructure cs = motorCommands[message.MotorAddress][currentCommands[message.MotorAddress]];
+                                cs.RetransmitState = QcRetransmitState.Retransmit_POL;
+                                cs.RunModeState = RunMode.Retransmit;
+                                cs.Retransmit = cs.History.Last();
+                                motorCommands[message.MotorAddress][currentCommands[message.MotorAddress]] = cs;
+                                Console.ForegroundColor = ConsoleColor.Cyan;
+                                Console.BackgroundColor = ConsoleColor.DarkBlue;
+                                Console.Write("Retransmit: " + cs.Retransmit.TxString);
+                                Console.ResetColor();
+                                Console.WriteLine();
+                            }
+                            return;
+                        }
+                    }
+                }
+                foreach (KeyValuePair<int, List<CommandStructure>> commands in motorCommands)
+                {
+                    bool breakloop = false;
+                    for (int i = 0; i < commands.Value.Count; i++)
+                    {
+                        CommandStructure command = motorCommands[commands.Key][i];
+                        string msg = "";
+                        switch (command.RunModeState)
+                        {
+                            case RunMode.Retransmit:
+                                Console.ForegroundColor = ConsoleColor.Cyan;
+                                Console.BackgroundColor = ConsoleColor.DarkBlue;
+                                Console.Write("Retransmit State [" + commands.Key + "]: " + command.RetransmitState.ToString());
+                                Console.ResetColor();
+                                Console.WriteLine();
+                                switch (command.RetransmitState)
+                                {
+                                    case QcRetransmitState.Retransmit_POL:
+                                        if (command.Retransmit.Command == QcCommand.POL)
+                                        {
+                                            command.RetransmitState = QcRetransmitState.Retransmit;
+                                            msg = QcDatagram.TranslateCommand(commands.Key, QcCommand.CPL, new List<string>(new string[] { "65535" }));
+                                            command.History.Add(new CommandState()
+                                            {
+                                                TxString = msg,
+                                                RetransmitState = command.RetransmitState,
+                                                RunModeState = command.RunModeState,
+                                                MotionPollingState = command.MotionPollingState,
+                                                Command = QcCommand.CPL
+                                            });
+                                            break;
+                                        }
+                                        command.RetransmitState = QcRetransmitState.Retransmit_CPL;
+                                        msg = QcDatagram.TranslateCommand(commands.Key, QcCommand.POL);
+                                        command.History.Add(new CommandState()
+                                        {
+                                            TxString = msg,
+                                            RetransmitState = command.RetransmitState,
+                                            RunModeState = command.RunModeState,
+                                            MotionPollingState = command.MotionPollingState,
+                                            Command = QcCommand.POL
+                                        });
+                                        break;
+                                    case QcRetransmitState.Retransmit_CPL:
+                                        if (message.Type == PacketType.Data || message.Type == PacketType.Ack)
+                                        {
+                                            command.RetransmitState = QcRetransmitState.Retransmit;
+                                            msg = QcDatagram.TranslateCommand(commands.Key, QcCommand.CPL, new List<string>(new string[] { "65535" }));
+                                            command.History.Add(new CommandState()
+                                            {
+                                                TxString = msg,
+                                                RetransmitState = command.RetransmitState,
+                                                RunModeState = command.RunModeState,
+                                                MotionPollingState = command.MotionPollingState,
+                                                Command = QcCommand.CPL
+                                            });
+                                        }
+                                        break;
+                                    case QcRetransmitState.Retransmit:
+                                        if (message.Type == PacketType.Data || message.Type == PacketType.Ack)
+                                        {
+                                            command.RetransmitState = QcRetransmitState.None;
+                                            msg = motorCommands[commands.Key][currentCommands[commands.Key]].Retransmit.TxString;
+                                            command.History.Add(new CommandState()
+                                            {
+                                                TxString = msg,
+                                                RetransmitState = command.RetransmitState,
+                                                RunModeState = command.RunModeState,
+                                                MotionPollingState = command.MotionPollingState,
+                                                Command = motorCommands[commands.Key][currentCommands[commands.Key]].Retransmit.Command
+                                            });
+                                        }
+                                        break;
+                                    case QcRetransmitState.None:
+                                        if (message.Type == PacketType.Data || message.Type == PacketType.Ack)
+                                        {
+                                            command.RunModeState = RunMode.Running;
+                                        }
+                                        break;
+                                }
+                                motorCommands[commands.Key][i] = command;
+                                breakloop = true;
+                                break;
+                            case RunMode.Complete:
+                                continue; 
+                            case RunMode.Halted:
+                                breakloop = true;
+                                break;
+                            case RunMode.Paused:
+                                breakloop = true;
+                                break;
+                            case RunMode.Running:
+                                breakloop = true;
+                                if (message.MotorAddress == commands.Key)
+                                {
+                                    switch (message.Type)
+                                    {
+                                        case PacketType.BadFormat:
+                                            break;
+                                        case PacketType.Command:
+                                            break;
+                                        case PacketType.Nak:
+                                            HaltCurrentCommand(commands.Key);
+                                            break;
+                                        case PacketType.Data:
+                                            msg = ProcessMotionState(commands.Key, i, command, message, true);
+                                            break;
+                                        case PacketType.Unknown:
+                                            break;
+                                        case PacketType.Ack:
+                                            msg = ProcessMotionState(commands.Key, i, command, message, true);
+                                            break;
+                                    }
+                                }
+                                else if (message.Type == PacketType.NoMessage)
+                                {
+                                    msg = ProcessMotionState(commands.Key, i, command, message, false);
+                                }
+                                break;
+                            case RunMode.Waiting:
+                                command.RunModeState = RunMode.Running;
+                                command.MotionPollingState = QcMotionPollingState.POL_Start;
+                                msg = QcDatagram.TranslateCommand(commands.Key, QcCommand.POL);
+                                command.History.Add(new CommandState()
+                                {
+                                    RetransmitState = command.RetransmitState,
+                                    RunModeState = command.RunModeState,
+                                    MotionPollingState = command.MotionPollingState,
+                                    TxString = msg,
+                                    Command = QcCommand.POL
+                                });
+                                command.DelayUntil = DateTime.Now;
+                                breakloop = true;
+                                motorCommands[commands.Key][i] = command;
+                                break;
+                        }
+                        if (msg.Length > 0)
+                            WriteLine(msg);
+                        if (breakloop)
+                        {
+                            currentCommands[commands.Key] = i;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        ~QcController()
+        {
+            if (Port.IsOpen)
+            {
+                Port.DiscardInBuffer();
+                Port.Close();
+                Port.Dispose();
+            }
+        }
+
+        public string PortName
+        {
+            get {
+                return Port.PortName;
+            }
+            set
+            {
+                bool IsRunning = CommunicationTimer.Enabled;
+                CommunicationTimer.Enabled = false;
+                string pname = Port.PortName;
+                try
+                {
+                    if (Port.IsOpen)
+                    {
+                        Port.Close();
+                    }
+                    Port.PortName = value;
+                    Port.Open();
+                    Port.DiscardInBuffer();
+                }
+                catch
+                {
+                    Port.PortName = pname;
+                    Port.Open();
+                    Port.DiscardInBuffer();
+                    throw new Exception("The port " + value + " cannot not be used to operate the Scratch Machine at this time.");
+                }
+                finally
+                {
+                    CommunicationTimer.Enabled = IsRunning;
+                }
+            }
+        }
+
+        public List<QcCommand> Commands
+        {
+            get
+            {
+                return commands;
+            }
+        }
+
+        private void WriteLine(string Line)
+        {
+            Console.WriteLine(Line);
+            while (Port.BytesToWrite > 0)
+                System.Threading.Thread.Sleep(5);
+            Port.WriteLine(Line);
+            DiagnosticOutput("W: " + Line);
+        }
+
+        public void StartCommands()
+        {
+            foreach (KeyValuePair<int, List<CommandStructure>> commands in motorCommands)
+            {
+                CommandStructure cs = motorCommands[commands.Key][0];
+                cs.RunModeState = RunMode.Running;
+                motorCommands[commands.Key][0] = cs;
+            }
+            CommunicationTimer.Enabled = true;
+            RunCommands(null);
+        }
+
+        public void Pause(int? MotorAddress = null)
+        {
+
+            if (MotorAddress == null)
+            {
+                foreach (KeyValuePair<int, List<CommandStructure>> commands in motorCommands)
+                {
+                    CommandStructure cs = motorCommands[commands.Key][0];
+                    cs.RunModeState = RunMode.Running;
+                    motorCommands[commands.Key][0] = cs;
+                }
+            }
+            else
+            {
+                CommandStructure cs = motorCommands[(int)MotorAddress][0];
+                cs.RunModeState = RunMode.Running;
+                motorCommands[(int)MotorAddress][0] = cs;
+            }
+        }
+
+        public void HaltCurrentCommand(int? MotorAddress = null, bool AllowIgnore = false)
+        {
+            if (MotorAddress == null)
+            {
+                bool GeneralHalt = true;
+                foreach (KeyValuePair<int, List<CommandStructure>> commands in motorCommands)
+                {
+                    CommandStructure cs = currentCommands.ContainsKey(commands.Key) ? motorCommands[commands.Key][currentCommands[commands.Key]] : motorCommands[commands.Key][0];
+                    if (!(AllowIgnore && cs.HaltMode == QcHaltMode.Ignore))
+                    {
+                        cs.RunModeState = RunMode.Halted;
+                        motorCommands[commands.Key][0] = cs;
+                        GeneralHalt = false;
+                    }
+                }
+                if (GeneralHalt)
+                    CommunicationTimer.Enabled = false;
+            }
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.BackgroundColor = ConsoleColor.DarkYellow;
+                Console.Write("Halt Motor: " + MotorAddress.ToString());
+                Console.ResetColor();
+                Console.WriteLine();
+                CommandStructure cs = currentCommands.ContainsKey((int)MotorAddress) ? motorCommands[(int)MotorAddress][currentCommands[(int)MotorAddress]] : motorCommands[(int)MotorAddress][0];
+                cs.RunModeState = RunMode.Halted;
+                motorCommands[(int)MotorAddress][0] = cs;
+                if (cs.HaltMode == QcHaltMode.HaltAllMotors)
+                    HaltCurrentCommand(null, true);
+            }
+        }
+
+        public void AddCommand(int MotorAddress, QcCommand Command, List<string> Parameters, QcHaltMode HaltMode)
+        {
+            DiagnosticOutput("COMMAND: " + Command + " " + string.Join(", ", Parameters.ToArray()));
+            if (MotorAddress > 0 && Port.IsOpen)
+            {
+                if (!motorCommands.ContainsKey(MotorAddress))
+                    motorCommands.Add(MotorAddress, new List<CommandStructure>());
+
+                motorCommands[MotorAddress].Add(new CommandStructure() {
+                     Command = Command,
+                     History = new List<CommandState>(),
+                     Parameters = Parameters,
+                     TxCommand = QcDatagram.TranslateCommand(MotorAddress, Command, Parameters),
+                     HaltMode = HaltMode,
+                     RunModeState = RunMode.Waiting,
+                     MotionPollingState = QcMotionPollingState.Start,
+                     RetransmitState = QcRetransmitState.None
+                });
+            }
+            else
+            {
+                throw new Exception("The diagnostic tool must have a motor address and COM Port configured.");
+            }
+        }
+
+        void Port_DataReceived(object sender, SerialDataReceivedEventArgs e)
+        {
+            lock (Buffer)
+            {
+                Buffer += Port.ReadExisting();
+                string[] lines = Buffer.Split(new char[1] { '\r' }, StringSplitOptions.RemoveEmptyEntries);
+                Responses.AddRange(lines.Take(lines.Length - 1));
+                if (Buffer[Buffer.Length - 1] == '\r')
+                {
+                    Responses.Add(lines[lines.Length - 1]);
+                    Buffer = "";
+                }
+                else
+                {
+                    Buffer = lines[lines.Length - 1];
+                }
+                if (Responses.Count >= LastUnprocessedResponse)
+                {
+                    for (int i = LastUnprocessedResponse; i < Responses.Count; i++)
+                    {
+                        DiagnosticOutput("R: " + Responses[i]);
+                        RunCommands(i);
+                        LastUnprocessedResponse++;
+                    }
+                }
+            }
+        }
+
+        public List<string> ComPorts()
+        {
+            return new List<string>(SerialPort.GetPortNames());
+        }
+    }
+
+}
